@@ -1,7 +1,7 @@
 # orange-opossum
 Paper #1 studying UK social care's CQC rating and their relationship with ownership types.
 
-### Note on the "Sage Sheep" project name
+### Note on the "Orange Opossum" project name
 
 Because project titles change all the time with revisions, rewriting,
 and peer review, we used [**codename**](http://svmiller.com/codename/)
