@@ -1,0 +1,353 @@
+---
+title: "Analysis of UK Social Care Data after ISIRC"
+author: "Meng Ye"
+date: "8/27/2022"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+## Read Me
+
+This is the data analysis RMarkdown file for the QCQ data after ISIRC 2022.
+
+Mainly changes: incorporating the contol of before and after COVID
+
+Please read the subtitles and notes added as normal text in this document. Blocks with darker backgrounds are code chunks, mostly with their outputs. I tried to add *#comments* within the chunck just before the code line to explain the purpose of the code line. Meanwhile I explain the purpose of the section in the texts, so that is where to find information to give you fuller pictures. 
+
+```{r contr}
+# environment setup to run ordered logit properly
+options(contrasts = rep("contr.treatment", 2))
+```
+
+
+This chunk loads all the packages to use
+
+```{r load package, message=FALSE, warning=FALSE}
+#packages for ordered logit
+library(ordinal) # package for ordinal logit regression
+library(brant) # brant test for the parallel assumption for ordered logit
+library(MASS) # models that work with the brant test
+
+library(tidyverse) # package for data cleaning and plotting
+library(readxl) # package for reading excel file
+library(broom) # extracting model summary as data frame
+library(modelsummary) # deriving model tables
+library(scales) # label percent
+library(lubridate) # working with dates
+library(marginaleffects) #to calculate marginal effects
+```
+
+
+
+## Data Preparation
+
+First, import the sampled and coded data set
+
+```{r import data, message=FALSE, warning=FALSE}
+#import the raw data file
+socialcare_raw <- read_csv("data/sample_new_cleaned.csv")
+```
+
+Assign orders to the ordinal level variables and name the organizational form in a reader-friendly way. 
+
+```{r data cleaning}
+#select relevant columns, rename and relabel 
+socialcare <- socialcare_raw %>% 
+  # recode legal form types to be more readable / easier to present
+  mutate(location_id = factor(location_id),
+         form = case_when(form_num == 1 ~ "FPO",
+                          form_num == 2 ~ "NPO",
+                          form_num == 3 ~ "GOV",
+                          form_num == 4 ~ "CIC",
+                          form_num == 5 ~ "IND",
+                          TRUE ~ NA_character_),
+         inherited = ifelse(inherited == "Y", TRUE, FALSE),
+         rating = recode(rating, 
+                         "Insufficient evidence to rate" = "NA",
+                         "Requires improvement" = "Req improv"),
+         publication_date = dmy(publication_date)) %>% 
+  # set the order of the values in the factors 
+  mutate(form = ordered(form, levels = c("FPO", "NPO", "GOV", "CIC", "IND")),
+         
+         # assume the order of the ratings as follows but need to double check with the source 
+         rating = ordered(rating, levels = c("Inadequate","Req improv", "Good", "Outstanding"))) %>% 
+  
+  # creating a new dummy variable for facility category
+  mutate(category = case_when(primary_cat == "Community based adult social care services" ~ "community",
+                              primary_cat == "Residential social care" ~ "residential",
+                              TRUE ~ as.character(NA)),
+         # deriving year column and dummy variable for before_covid
+         year = year(publication_date),
+         after_covid = ifelse(year > 2019, TRUE, FALSE)) %>%
+
+  # converting the ordinal variable to numerical 
+  mutate(rating_num = case_when(rating == "Inadequate" ~ 1,
+                                rating == "Req improv" ~ 2,
+                                rating == "Good" ~ 3,
+                                rating == "Outstanding" ~ 4)) %>% 
+  # derive the rating dummy
+  mutate(rating_higher = ifelse(rating_num > 2, 1, 0))
+
+# show first several rows of the data set derived 
+head(socialcare)
+
+```
+
+```{r}
+socialcare %>% 
+  group_by(year, form) %>% 
+  drop_na(rating_num) %>% 
+  summarise(count = n(),
+            perform = mean(rating_num))
+```
+
+
+## Descriptive analysis
+
+```{r}
+table1 <- datasummary((category + inherited + after_covid +  region) ~ form,
+                      data = socialcare, fmt = 0)
+table1
+```
+
+
+
+
+
+
+## Running OLS models 
+
+The OLS models and the ordered logit models can be written as follows
+
+$rating_{numerical} = \beta_0 + \beta_1form + \beta_2category+ \beta_3region + \beta_4inherited + u$
+
+$log-odds(rating_{ordinal} \leq j) = \beta_{j0} + \beta_1form + \beta_2category+ \beta_3region + \beta_4inherited + u$
+
+In this section, we first run the OLS models. In the OLS models, we kind of "cheat" R by treating the four rating levels with orders as if they are numbers 1-4. There are the flowing reasons that we report the results from OLS models, even though the more suitable methods should be ordered logit models, about which we will discuss in a while.
+
+1) The purpose of fitting OLS models is to use them as benchmarks. 
+2) Since there are issues like heteroscedasticity, the standard errors calculated are not reliable. But the correlation relationships between the independent variables and dependent variables are still true. So the results are still informative 
+3) Plus, compared with the ordered logit models we run later, the results are more straightforward, and more easily give us intuition about how different legal forms of social care providers impact the service quality ratings. 
+4) The OLS models are intended to be compared with the ordered logit models. As shown later, the results are generally consistent between the two model families, confirming that our model specification is robust between different models.
+
+
+
+### OLS with the sub-domain ratings one by one 
+
+```{r}
+# run the model loops with nest() method
+models_ols <- socialcare %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(ols_models = map(data, 
+                          ~lm(rating_num ~ form + 
+                              category + region + inherited , 
+                              data = .x))) %>% 
+  mutate(results = map(ols_models, ~tidy(.x, conf.int = TRUE))) %>% 
+  pull(ols_models, name = domain)
+```
+
+```{r}
+# run the model loops with nest() method
+# add before_covid as control
+# add also interaction term
+table_ols <- modelsummary(models_ols, statistic = "({p.value}) {stars}")
+table_ols
+```
+
+
+
+```{r}
+# run the model loops with nest() method
+# add after_covid as control
+models_ols_covid <- socialcare %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(ols_models = map(data, 
+                          ~lm(rating_num ~ form + after_covid + 
+                              category + region + inherited, 
+                              data = .x))) %>% 
+  mutate(results = map(ols_models, ~tidy(.x, conf.int = TRUE))) %>% 
+  pull(ols_models, name = domain) 
+```
+
+```{r}
+table_ols_covid <- modelsummary(models_ols_covid, statistic = "({p.value}) {stars}")
+table_ols_covid
+```
+
+
+```{r}
+# run the model loops with nest() method
+# add after_covid as control
+# and interaction term
+models_ols_inter <- socialcare %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(ols_models = map(data, 
+                          ~lm(rating_num ~ form * after_covid + 
+                              category + region + inherited, 
+                              data = .x))) %>% 
+  mutate(results = map(ols_models, ~tidy(.x, conf.int = TRUE))) 
+
+models_ols_inter_named <- models_ols_inter %>% 
+  pull(ols_models, name = domain)
+```
+
+
+
+
+```{r}
+table_ols_inter <- modelsummary(models_ols_inter_named, statistic = "({p.value}) {stars}")
+table_ols_inter
+```
+
+
+## Average Marginal Effects
+
+For curvy fitted model line, the fitted coefficients is less meaningful than a average marginal effect concept.
+
+Dr. Heiss has a very detailed blog post on this: https://www.andrewheiss.com/blog/2022/05/20/marginalia/
+
+
+
+
+
+
+```{r}
+marginal_ols_inter <- models_ols_inter %>% 
+  mutate(ame = map(ols_models,
+                   ~ summary(marginaleffects(.)))) %>%
+  mutate(nice_name = paste(domain, "ame"))
+```
+
+
+```{r}
+ame_ols_inter_named <- marginal_ols_inter %>% 
+  pull(ame, name = nice_name)
+```
+
+```{r}
+table_ame_ols_inter <- tribble(
+  ~domain, ~ame_df,
+  "safe",  ame_ols_inter_named[["Safe ame"]],
+  "effective", ame_ols_inter_named[["Effective ame"]],
+  "caring",  ame_ols_inter_named[["Caring ame"]],
+  "responsive", ame_ols_inter_named[["Responsive ame"]],
+  "well-led",  ame_ols_inter_named[["Well-led ame"]],
+  "overall", ame_ols_inter_named[["Overall ame"]]
+) %>% 
+  unnest(ame_df) %>% 
+  filter(term == "form")
+
+table_ame_ols_inter
+```
+
+
+
+```{r}
+# commented out for the moment
+# table_ols_inter <- modelsummary(ame_ols_inter_named, statistic = "({p.value}) {stars}")
+#table_ols_inter
+```
+
+
+The gap of before vs. after covid rating (before is higher) is larger for for-profit
+smaller for NPO, GOV, which is consistent with the NYT articles
+
+**update**: more complex when interpreting non-linear marginal effects
+http://datacolada.org/57
+
+```{r}
+# run the model loops with nest() method
+models_logit <- socialcare %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(logit_models = map(data, 
+                          ~glm(rating_higher ~ form + 
+                              category + region + inherited , 
+                              data = .x,  family = binomial(link = "logit")))) %>% 
+  mutate(results = map(logit_models, ~tidy(.x, conf.int = TRUE))) 
+
+models_logit_named <- models_logit %>% 
+  pull(logit_models, name = domain)
+```
+
+## Running logit models 
+
+```{r}
+table_logit <- modelsummary(models_logit_named, statistic = "({p.value}) {stars}")
+table_logit
+```
+
+
+
+## Running ordered logit models 
+
+I find this reference regarding understanding ordered logit models useful. 
+https://stats.oarc.ucla.edu/r/dae/ordinal-logistic-regression/
+
+
+```{r}
+# run the model loops with nest() method
+models_order <- socialcare_num %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(ordinal_models = map(data, 
+                          ~clm(rating ~ form + 
+                              category + region + inherited , 
+                              data = .x, link = "logit"))) %>% 
+  mutate(results = map(ordinal_models, ~tidy(.x, conf.int = TRUE))) %>% 
+  pull(ordinal_models, name = domain)
+```
+
+
+```{r}
+table_order <- modelsummary(models_order, statistic = "({p.value}) {stars}")
+table_order
+```
+
+
+```{r message=FALSE, warning=FALSE}
+# run the model loops with nest() method
+# add before_covid as control
+models_order_covid <- socialcare_num %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(ordinal_models = map(data, 
+                          ~clm(rating ~ form + before_covid +
+                              category + region + inherited , 
+                              data = .x, link = "logit"))) %>% 
+  mutate(results = map(ordinal_models, ~tidy(.x, conf.int = TRUE))) %>% 
+  pull(ordinal_models, name = domain)
+```
+```{r}
+table_order_covid <- modelsummary(models_order_covid, statistic = "({p.value}) {stars}")
+table_order_covid
+```
+
+
+```{r}
+# run the model loops with nest() method
+# add before_covid as control
+# and interaction term
+models_order_inter <- socialcare_num %>% 
+  group_by(domain) %>% 
+  nest()%>% 
+  mutate(ordinal_models = map(data, 
+                          ~clm(rating ~ form * before_covid + 
+                              category + region + inherited, 
+                              data = .x, link = "logit"))) %>% 
+  mutate(results = map(ordinal_models, ~tidy(.x, conf.int = TRUE))) %>% 
+  pull(ordinal_models, name = domain)
+```
+```{r}
+table_order_inter <- modelsummary(models_order_inter, statistic = "({p.value}) {stars}")
+table_order_inter
+```
+
+
+
+

@@ -1,0 +1,221 @@
+---
+title: "Ordered Logit Models ARNOVA"
+author: "Meng Ye"
+date: "10/28/2022"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+## Read Me
+
+This is the data analysis RMarkdown file for the QCQ data after ISIRC 2022.
+
+Mainly changes: incorporating the control of before and after (during) COVID
+
+Please read the subtitles and notes added as normal text in this document. Blocks with darker backgrounds are code chunks, mostly with their outputs. I tried to add *#comments* within the chunks just before the code line to explain the purpose of the code line. Meanwhile I explain the purpose of the section in the texts, so that is where to find information to give you fuller pictures. 
+
+```{r contr}
+# environment setup to run ordered logit properly
+options(contrasts = rep("contr.treatment", 2))
+```
+
+
+This chunk loads all the packages to use
+
+```{r load package, message=FALSE, warning=FALSE}
+#packages for ordered logit
+library(ordinal) # package for ordinal logit regression
+library(brant) # brant test for the parallel assumption for ordered logit
+library(MASS) # models that work with the brant test
+
+library(tidyverse) # package for data cleaning and plotting
+library(readxl) # package for reading excel file
+library(broom) # extracting model summary as data frame
+library(modelsummary) # deriving model tables
+library(scales) # label percent
+library(lubridate) # working with dates
+library(marginaleffects) # to calculate marginal effects
+library(here) # manage directory
+```
+
+
+
+## Data Preparation
+
+First, import the sampled and coded data set
+
+```{r import data, message=FALSE, warning=FALSE}
+#import the curated social care data file
+#socialcare_raw <- read_csv("data/sample_new_cleaned.csv")
+socialcare_new <-read_rds(here("data", "derived_data", "sample_new.rds"))
+```
+
+Assign orders to the ordinal level variables and name the organizational form in a reader-friendly way. 
+
+```{r data cleaning}
+#select relevant columns, rename and relabel 
+socialcare <- socialcare_new %>% 
+  # recode legal form types to be more readable / easier to present
+  mutate(location_id = factor(location_id),
+         form = case_when(form_num == 1 ~ "FPO",
+                          form_num == 2 ~ "NPO",
+                          form_num == 3 ~ "GOV",
+                          form_num == 4 ~ "CIC",
+                          form_num == 5 ~ "IND",
+                          TRUE ~ NA_character_),
+         inherited = ifelse(inherited == "Y", TRUE, FALSE),
+         rating = recode(rating, 
+                         "Insufficient evidence to rate" = "NA",
+                         "Requires improvement" = "Req improv"),
+         publication_date = dmy(publication_date)) %>% 
+  # set the order of the values in the factors 
+  mutate(form = fct_relevel(form, "FPO"),
+         
+         # assume the order of the ratings as follows but need to double check with the source 
+         rating = ordered(rating, levels = c("Inadequate","Req improv", "Good", "Outstanding"))) %>% 
+  
+  # creating a new dummy variable for facility category
+  mutate(category = case_when(
+                    primary_cat == "Community based adult social care services" ~ "community",
+                    primary_cat == "Residential social care" ~ "residential",
+                    TRUE ~ as.character(NA)),
+         # deriving year column and dummy variable for before_covid
+         year = year(publication_date),
+         during_covid = ifelse(year >= 2020, TRUE, FALSE),
+         before_covid = ifelse(year <= 2019, TRUE, FALSE)) %>%
+
+  # converting the ordinal variable to numerical 
+  mutate(rating_num = case_when(rating == "Inadequate" ~ 1,
+                                rating == "Req improv" ~ 2,
+                                rating == "Good" ~ 3,
+                                rating == "Outstanding" ~ 4)) %>% 
+  # derive the rating dummy
+  mutate(rating_higher = ifelse(rating_num > 2, 1, 0))
+
+# show first several rows of the data set derived 
+head(socialcare)
+
+```
+
+
+## Summerize at different Levels
+
+```{r}
+socialcare %>% 
+  summarise(observation = n(),
+            location = n_distinct(location_id),
+            provider = n_distinct(provider_name))
+```
+
+
+
+```{r}
+socialcare %>% 
+  group_by(form) %>% 
+  summarise(observation = n(),
+            location = n_distinct(location_id),
+            provider = n_distinct(provider_name))
+```
+
+```{r}
+socialcare %>% 
+  group_by(cic_type) %>% 
+  summarise(observation = n(),
+            location = n_distinct(location_id),
+            provider = n_distinct(provider_name))
+```
+
+## whole model without COVID control 
+
+```{r logit-sans-covid}
+model_order_overall <- clm(rating ~ form + category + region + inherited,
+                data = filter(socialcare, domain == "Overall"),
+                link = "logit")
+model_order_safe <- clm(rating ~ form + category + region + inherited,
+                data = filter(socialcare, domain == "Safe"),
+                link = "logit")
+model_order_effective <- clm(rating ~ form + category + region + inherited,
+                data = filter(socialcare, domain == "Effective"),
+                link = "logit")
+model_order_caring <- clm(rating ~ form + category + region + inherited,
+                data = filter(socialcare, domain == "Caring"),
+                link = "logit")
+model_order_well_led <- clm(rating ~ form + category + region + inherited,
+                data = filter(socialcare, domain == "Well-led"),
+                link = "logit")
+model_order_responsive <- clm(rating ~ form + category + region + inherited,
+                data = filter(socialcare, domain == "Responsive"),
+                link = "logit")
+```
+
+```{r}
+ordinal_models <- modelsummary(list("overall" = model_order_overall, "safe" = model_order_safe, 
+                                    "effective" = model_order_effective, "caring"= model_order_caring, 
+                                    "well-led" = model_order_well_led, "responsive" = model_order_responsive),
+                               coef_omit = "region", exponentiate = F,
+                               statistic = "({p.value}) {stars}")
+ordinal_models
+```
+
+
+```{r}
+ordinal_models_exp <- modelsummary(list("overall" = model_order_overall, "safe" = model_order_safe, 
+                                    "effective" = model_order_effective, "caring"= model_order_caring, 
+                                    "well-led" = model_order_well_led, "responsive" = model_order_responsive),
+                               coef_omit = "region", exponentiate = T,
+                               statistic = "({p.value}) {stars}")
+ordinal_models_exp
+```
+
+## whole model with COVID control 
+
+
+```{r logit-covid-control}
+model_order_overall_covid <- clm(rating ~ form + during_covid + 
+                                   category + region + inherited,
+                data = filter(socialcare, domain == "Overall"),
+                link = "logit")
+model_order_safe_covid <- clm(rating ~ form + during_covid +
+                                category + region + inherited,
+                data = filter(socialcare, domain == "Safe"),
+                link = "logit")
+model_order_effective_covid <- clm(rating ~ form + during_covid +
+                                     category + region + inherited,
+                data = filter(socialcare, domain == "Effective"),
+                link = "logit")
+model_order_caring_covid <- clm(rating ~ form + during_covid + 
+                                  category + region + inherited,
+                data = filter(socialcare, domain == "Caring"),
+                link = "logit")
+model_order_well_led_covid <- clm(rating ~ form + during_covid +
+                                    category + region + inherited,
+                data = filter(socialcare, domain == "Well-led"),
+                link = "logit")
+model_order_responsive_covid <- clm(rating ~ form + during_covid +
+                                      category + region + inherited,
+                data = filter(socialcare, domain == "Responsive"),
+                link = "logit")
+```
+
+
+```{r}
+ordinal_models_covid <- modelsummary(list("overall" = model_order_overall_covid, "safe" = model_order_safe_covid, 
+                                    "effective" = model_order_effective_covid, "caring"= model_order_caring_covid, 
+                                    "well-led" = model_order_well_led_covid, "responsive" = model_order_responsive_covid),
+                               coef_omit = "region", exponentiate = F,
+                               statistic = "({p.value}) {stars}")
+ordinal_models_covid
+```
+
+```{r}
+ordinal_models_covid_exp <- modelsummary(list("overall" = model_order_overall_covid, "safe" = model_order_safe_covid, 
+                                    "effective" = model_order_effective_covid, "caring"= model_order_caring_covid, 
+                                    "well-led" = model_order_well_led_covid, "responsive" = model_order_responsive_covid),
+                               coef_omit = "region", exponentiate = T,
+                               statistic = "({p.value}) {stars}")
+ordinal_models_covid_exp
+```
+
+
