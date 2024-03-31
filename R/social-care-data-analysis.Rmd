@@ -248,7 +248,7 @@ ordinal_models_covid_exp
 # run the model with nest() method
 # add after_covid as control
 models_ols_covid <- socialcare %>% 
-  mutate(domain = fct_relevel(domain, "Overall")) %>% 
+  mutate(domain = fct_relevel(domain, "Overall","Safe","Effective", "Caring", "Well-led", "Responsive")) %>% 
   group_by(domain) %>% 
   nest()%>% 
   mutate(ols_models = map(data, 
