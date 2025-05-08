@@ -1,0 +1,228 @@
+---
+title: "Full rating data cleaning"
+author: "Meng Ye"
+date: "4/22/2025"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+## Introduction and Setup 
+
+This file contains the exploration of the two full CQC data files "cqc_full" and "raw_directory".
+
+### Load packages 
+
+```{r load package, message=FALSE, warning=FALSE}
+library(tidyverse) # package for data cleaning and plotting
+library(jsonlite) # to read json data
+library(readODS)  # read ODS file 
+library(readxl)   # read excel
+library(janitor) # clean variable names
+library(here) # manage directory
+library(gt)
+library(writexl)
+set.seed(5432)
+```
+
+
+### Import Raw Data 
+
+
+```{r import data, message=FALSE, warning=FALSE}
+# Raw CQC full data (with unfriendly column names) to over sampling CICs
+rating_raw <- read_excel(here("data", "raw_data", "full_ratings.xlsx"))
+ 
+# import charities commission data
+charities <- read_csv(here("data", "raw_data", "charities.csv"))
+
+# manually coded (cross-checking against Companies House registration record) individuals and partnerships providers data
+directory_raw <- read_excel(here("data", "raw_data", "full_directory.xlsx"))
+```
+
+
+## Clean the location directory data-set
+
+```{r}
+directory_rename <- directory_raw |>
+  clean_names()
+```
+
+
+```{r}
+# select columns to use in the directory data set
+directory_to_join <- directory_rename %>% 
+  select(location_id, care_homes_beds, provider_companies_house_number, provider_charity_number,
+         provider_ownership_type, starts_with("service_user_band")) %>% 
+          mutate(across(
+          # Target service user band columns
+          starts_with("service_user_band"),  # <-- Verify this is the correct prefix!
+          
+          # Recode logic
+          ~ case_when(
+            .x == "Y" ~ TRUE,
+            is.na(.x) ~ FALSE,
+            TRUE      ~ FALSE  # Default for other values
+          )))
+```
+
+
+## Clean the rating data-set
+
+```{r}
+# recode the column names}
+rating_rename <- rating_raw |>
+  clean_names() %>% 
+  rename(inherited = inherited_rating_y_n,
+         rating = latest_rating,
+         primary_cat = location_primary_inspection_category) %>% 
+  filter(location_type == "Social Care Org")
+# print out the recoded col names
+colnames(rating_rename)
+```
+
+## merge the two data sets
+
+
+```{r rename and filter, message=FALSE, warning=FALSE}
+rating_merged <- rating_rename %>% 
+  left_join(directory_to_join, by = "location_id")
+# print out the column names
+colnames(rating_merged)
+```
+
+## coding the legal forms
+
+### Standardize the provider name
+
+```{r sample std}
+rating_std <- rating_merged %>% 
+# remove dots
+  mutate(std_name = str_replace_all(provider_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC"))
+```
+
+
+### Code the GOV and CIC
+
+Set the string detectors
+
+```{r}
+## building the string detect conditions
+gov_terms <- c("NHS ", "FOUNDATION TRUST", "COUNCIL", " CC ", " MDC ", " DC ", " BC ", "BOROUGH")
+gov_filter <- paste0("\\b(", paste(gov_terms, collapse = "|"), ")\\b")
+
+cic_terms <- c("CIC")
+cic_filter <- paste0("\\b(", paste(cic_terms, collapse = "|"), ")\\b")
+```
+
+###
+
+```{r}
+## filtering out CICs and GOVs
+rating_detect <- rating_std %>% 
+  mutate(
+    form = case_when(
+      str_detect(std_name, gov_filter) ~ "GOV",
+      str_detect(std_name, cic_filter) ~ "CIC",
+      TRUE ~ NA_character_)) %>% 
+  mutate(
+    form = case_when(
+      # 1. Preserve existing CIC/GOV classifications
+      form %in% c("CIC", "GOV") ~ form,
+      is.na(form) & !is.na(provider_companies_house_number) ~ "FPO",
+      TRUE ~ form)) %>% 
+  mutate(
+    form = ifelse(!is.na(provider_charity_number), "NPO", form)
+  ) %>% 
+  mutate(
+    form = ifelse(provider_ownership_type %in% c("Partnership", "Individual"), "IND", form)
+  )
+    
+```
+
+```{r}
+rating_detect %>%
+  count(form, name = "n_rows")
+```
+
+
+
+
+
+###  Derive a smaller sub set (select necessary columns) of Charity Commision data
+
+```{r CC subset}
+charity_selected <- charities %>% 
+# filter out only active charities
+  filter(charity_registration_status == "Registered") %>% 
+# select only potentially useful columns 
+  select(charity_number = registered_charity_number,
+         charity_name, charity_type,
+         charity_registration_date = date_of_registration,
+         charity_company_number = charity_company_registration_number)
+```
+
+
+### Standardize Charity Commision org name expression 
+
+```{r CC std}
+charity_renamed <- charity_selected %>% 
+# remove dots
+  mutate(std_name = str_replace_all(charity_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC")) %>% 
+# standardize to CIO
+  mutate(std_name = str_replace_all(std_name, "CHARITABLE INCORPORATED ORGANISATION", "CIO")) 
+```
+
+
+
+### update the charity list by merging in the charities commissions data
+
+```{r}
+# select charity std names and code the form type as "NPO".
+charity_list <- charity_renamed %>% 
+  select(std_name) %>% 
+  mutate(charity_form = "NPO") %>% 
+# Drop repetition
+  group_by(std_name) %>% 
+  slice(1) %>% 
+  ungroup()
+
+rating_clean <- rating_detect %>% 
+# add data with refined coding
+  left_join(charity_list, by = "std_name") %>% 
+# supersede old coding with new coding
+  mutate(form = ifelse(is.na(charity_form), form, charity_form)) %>% 
+  select(- charity_form)
+```
+
+
+```{r}
+rating_clean %>%
+  count(form, name = "n_rows")
+```
+
+
+
+## Save data
+
+```{r eval = FALSE}
+write_rds(rating_clean, file = here("data", "derived_data", "rating_clean.rds"))
+write_csv(rating_clean, file = here("data", "derived_data", "rating_clean.csv"))
+```
+
+
+
+

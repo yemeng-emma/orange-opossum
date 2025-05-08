@@ -1,0 +1,499 @@
+---
+title: "Full rating and directory data inspection"
+author: "Meng Ye"
+date: "3/28/2025"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+## Introduction and Setup 
+
+This file contains the exploration of the two full CQC data files "cqc_full" and "raw_directory".
+
+### Load packages 
+
+```{r load package, message=FALSE, warning=FALSE}
+library(tidyverse) # package for data cleaning and plotting
+library(jsonlite) # to read json data
+library(readODS)  # read ODS file 
+library(readxl)   # read excel
+library(janitor) # clean variable names
+library(here) # manage directory
+library(gt)
+library(writexl)
+set.seed(5432)
+```
+
+
+### Import Raw Data 
+
+
+```{r import data, message=FALSE, warning=FALSE}
+# Raw CQC full data (with unfriendly column names) to over sampling CICs
+rating_raw <- read_csv(here("data", "raw_data", "cqc_full.csv"))
+ 
+# import charities commission data
+charities <- read_csv(here("data", "raw_data", "charities.csv"))
+
+# manually coded (cross-checking against Companies House registration record) individuals and partnerships providers data
+directory_raw <- read_excel(here("data", "raw_data", "full_directory.xlsx"))
+```
+
+
+## Data insepection
+
+```{r}
+directory_rename <- directory_raw |>
+  clean_names()
+```
+
+
+```{r}
+# Count records per region and local authority
+distribution_table <- directory_rename %>%
+  group_by(location_region, location_local_authority) %>%
+  summarise(n = n(), .groups = "drop")  # Count observations
+
+# Print the table (sorted by region and count)
+distribution_table %>%
+  arrange(location_region, desc(n)) %>% gt()
+```
+
+
+
+
+```{r}
+n_distinct(rating_raw$`Provider ID`)
+```
+
+```{r}
+n_distinct(directory_raw$`Provider ID`)
+```
+```{r}
+na_summary_tidy <- directory_rename %>%
+  select(starts_with("service_user_band_")) %>%   # Select target columns
+  summarise(across(everything(), ~sum(is.na(.x)))) %>%  # Count NAs
+  pivot_longer(
+    everything(),
+    names_to = "column",
+    values_to = "na_count"
+  ) %>%
+  mutate(
+    na_ratio = na_count / nrow(directory_rename),  # Calculate ratio
+    na_percent = round(na_ratio * 100, 1)          # Optional: add %
+  ) %>%
+  arrange(desc(na_count))                          # Sort by highest NA count
+
+# Print the tidy summary
+na_summary_tidy
+```
+
+```{r message=FALSE, warning=FALSE}
+# Save as Excel
+write_xlsx(na_summary_tidy, here("data", "derived_data", "na_summary_tidy.xlsx"))
+
+```
+
+
+```{r}
+library(dplyr)
+
+# Count rows where ALL columns are NA
+all_na_count <- directory_rename %>%
+  filter(if_all(everything(), is.na)) %>%  # Keep rows where all columns are NA
+  summarise(all_na_count = n())            # Count those rows
+
+# Print the result
+all_na_count
+```
+
+
+No missing values for the question
+
+### Clean and filter out Gov and CIC providers
+
+```{r rename and filter, message=FALSE, warning=FALSE}
+### Rename the columns 
+
+locations_renamed <- rating_raw %>% 
+  rename(primary_cat = `Location Primary Inspection Category`,
+         region = `Location Region`,
+         domain = `Domain`, # named to "Domain" later
+         rating = `Latest Rating`,
+ #        inherited = `Inherited Rating (Y/N)`, # no such a column in 2017 data
+         provider_name = `Provider Name`,
+         publication_date = `Publication Date`,
+         address = `Location Street Address`) 
+```
+
+
+
+### Standardize the provider name
+
+```{r sample std}
+locations_std <- locations_renamed %>% 
+# remove dots
+  mutate(std_name = str_replace_all(provider_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC"))
+```
+
+
+### filtering out CIC and GOV providers
+
+```{r}
+## building the string detect conditions
+keep_terms <- c("CIC", "NHS ", "FOUNDATION TRUST", "COUNCIL", " CC ", " MDC ", " DC ", " BC ", "BOROUGH")
+keep_filter <- paste0("\\b(", paste(keep_terms, collapse = "|"), ")\\b")
+```
+
+###
+
+```{r}
+## filtering out CICs and GOVs
+locations_coded <- locations_std %>% 
+  filter(str_detect(std_name, keep_filter)) %>% 
+#  filter(!str_detect(std_name, "BOROUGH GREEN\\s|BOROUGH ROAD\\s")) %>% (save for false positives)
+  ## add the form and level columns
+  mutate(form = ifelse(str_detect(std_name, "CIC"), "CIC", "GOV")) 
+nrow(locations_coded)
+```
+```{r}
+#filter out the government list
+
+gov_list <- locations_coded %>% 
+  filter(form == "GOV") %>% 
+  select(provider_name) %>% 
+  group_by(provider_name) %>% 
+  slice(1)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+
+# Save as Excel
+write_xlsx(gov_list, here("data", "derived_data", "gov_list.xlsx"))
+
+```
+
+
+----------separate line ------------
+
+Derive CQC provider list
+
+```{r}
+cqc_provider <- directory_rename %>% 
+  select(provider_name, provider_companies_house_number, provider_charity_number, provider_ownership_type) %>% 
+  group_by(provider_name) %>% 
+  slice(1)
+
+```
+
+```{r}
+# Save as Excel
+write_xlsx(cqc_provider, here("data", "derived_data", "cqc_provider.xlsx"))
+```
+
+
+----------separate line ------------
+
+### 1a. Rename coded sample data frame columns to be more R-friendly 
+
+```{r rename sample}
+socialcare_renamed <- socialcare_raw %>% 
+  rename(primary_cat = `Location Primary Inspection Category`,
+         region = `Location Region`,
+         domain = Domain,
+         rating = latest_rating,
+         inherited = `Inherited Rating (Y/N)`,
+         provider_name = `Provider Name`,
+         form_num = legal_form,
+         publication_date = `Publication Date`) %>% 
+  select(- `...1`, -`Location Type`) %>% 
+  filter(location_type == "Social Care Org")
+```
+
+```{r}
+head(socialcare_renamed)
+```
+
+
+
+### 1b. Standardize coded sample data frame's org name expression
+
+```{r sample std}
+socialcare_renamed <- socialcare_renamed %>% 
+# remove dots
+  mutate(std_name = str_replace_all(provider_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC"))
+```
+
+
+### 2a. Rename full cqc data frame columns to be more R-friendly 
+
+```{r rename cqc full data set}
+cqc_renamed <- cqc_raw %>% 
+  rename(primary_cat = `Location Primary Inspection Category`,
+         region = `Location Region`,
+         domain = Domain,
+         rating = `Latest Rating`,
+         inherited = `Inherited Rating (Y/N)`,
+         provider_name = `Provider Name`,
+         location_id = `Location ID`,
+         location_type = `Location Type...26`,
+         publication_date = `Publication Date`) %>% 
+  select(-`Location Type...5`, -`Legal Form`) %>% 
+  filter(location_type == "Social Care Org")
+
+
+```
+
+
+### 2b. Standardize coded sample data frame's org name expression
+
+```{r cqc std}
+cqc_renamed <- cqc_renamed %>% 
+# remove dots
+  mutate(std_name = str_replace_all(provider_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC")) %>% 
+# standardize to CIO
+  mutate(std_name = str_replace_all(std_name, "CHARITABLE INCORPORATED ORGANISATION", "CIO")) 
+```
+
+
+### 3. Standardize CIC list org name expression 
+
+```{r cic full list std}
+cic_renamed <- cic_recoded %>% 
+  select(-`...1`, - legal_name, cic_number)  %>% 
+# remove dots
+  mutate(std_name = str_replace_all(provider_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC")) %>% 
+# standardize to CIO
+  mutate(std_name = str_replace_all(std_name, "CHARITABLE INCORPORATED ORGANISATION", "CIO")) %>% 
+# delete unnecessary columns to make sure combining row align better later
+  select(- cic_number, - provider_name)
+```
+
+
+### 4a. Derive a smaller sub set (select necessary columns) of Charity Commision data
+
+```{r CC subset}
+charity_selected <- charities %>% 
+# filter out only active charities
+  filter(charity_registration_status == "Registered") %>% 
+# select only potentially useful columns 
+  select(charity_number = registered_charity_number,
+         charity_name, charity_type,
+         charity_registration_date = date_of_registration,
+         charity_company_number = charity_company_registration_number)
+```
+
+
+### 4b. Standardize Charity Commision org name expression 
+
+```{r CC std}
+charity_renamed <- charity_selected %>% 
+# remove dots
+  mutate(std_name = str_replace_all(charity_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC")) %>% 
+# standardize to CIO
+  mutate(std_name = str_replace_all(std_name, "CHARITABLE INCORPORATED ORGANISATION", "CIO")) 
+```
+
+
+### 5.Standardize individual/partnership provider name expression 
+
+Based on Dr. Kerlin's code, this is what I did:
+
+
+1.	Leave it as the same type individual/partnerships for blank rows
+2.  Leave it as the same type individual/partnerships for rows with No-No for both Charity Commission and Company House
+3.	Recode those have limited by shares Company House records as “for-profit”. 
+4.	Recode “LLP” to for-profit 
+5.  Recode company limited by guarantee to "NA", because we are not sure if it is nonprofit or not
+(See https://en.wikipedia.org/wiki/Private_company_limited_by_guarantee, especially under Commercial enterprises)
+4.	Recode to “NA” for those marked with several possibilities 
+
+
+```{r rename indivial and partnership}
+small_renamed <- small %>% 
+  select(provider_name, small_form_num) %>% 
+  
+# remove dots
+  mutate(std_name = str_replace_all(provider_name, "\\.", "")) %>% 
+# capitalize all
+  mutate(std_name = str_to_upper(std_name)) %>%
+# standardize to LTD
+  mutate(std_name = str_replace_all(std_name, "LIMITED", "LTD")) %>% 
+# standardize to CIC
+  mutate(std_name = str_replace_all(std_name, "COMMUNITY INTEREST COMPANY", "CIC")) %>% 
+# standardize to CIO
+  mutate(std_name = str_replace_all(std_name, "CHARITABLE INCORPORATED ORGANISATION", "CIO")) %>% 
+  select(-provider_name)
+```
+
+
+
+## Data cleanning - merging and recoding 
+
+### 1. Use full CIC list and complete CQC data to derive full CIC data frame
+
+```{r cic over sample data}
+cic_over_sample <- cic_renamed %>% 
+  left_join(cqc_renamed, by = "std_name") %>% 
+# mark that the form is cic
+  mutate(form_num = 4)
+```
+
+Now we check the merged data, there are 540 rows (for 57 organizations because of multiple locations and multiple rating domains) and 33 variables. 
+```{r cic over sample data check}
+head(cic_over_sample, 10)
+```
+
+
+### 2. Merge orginical sample with the full CIC sample 
+
+First we carve out the CICs from the old samples 
+```{r merge old sample and cic}
+sample_no_cic <- socialcare_renamed %>% 
+## leave out old cic orgs from the coded sample
+  filter(form_num != 4)
+```
+
+Then we combine the sample without (old) CICs and the full CICs data
+
+```{r add full cic}
+sample_v2 <- bind_rows(sample_no_cic, cic_over_sample)
+head(sample_v2)
+```
+
+
+### 3. Merge the updated sample v2 with indivial/partnership data
+
+```{r merge in small}
+# select fewer columns to merge
+sample_v3 <- sample_v2 %>% 
+# add data with refined coding
+  left_join(small_renamed, by = "std_name") %>% 
+# supersede old coding with new coding
+  mutate(form_num = ifelse(form_num == 5, small_form_num, form_num)) %>% 
+  select(- small_form_num)
+
+tail(sample_v3)
+```
+
+### 4. Merge the updated sample v3 with Charity data
+
+```{r}
+# select charity std names and code the form type as "2".
+charity_list <- charity_renamed %>% 
+  select(std_name) %>% 
+  mutate(charity_form_num = 2) %>% 
+# Drop repetition
+  group_by(std_name) %>% 
+  slice(1) %>% 
+  ungroup()
+
+sample_v4 <- sample_v3 %>% 
+# add data with refined coding
+  left_join(charity_list, by = "std_name") %>% 
+# supersede old coding with new coding
+  mutate(form_num = ifelse(is.na(charity_form_num), form_num, charity_form_num)) %>% 
+  select(- charity_form_num)
+
+sample_new <- sample_v4%>% 
+  mutate(index = 1:nrow(sample_v4))
+```
+
+
+## Check how much change was made
+
+
+```{r distribution old name}
+sample_new %>% 
+  count(form_num)
+```
+
+
+Note:
+                case_when(form_num == 1 ~ "FPO",
+                          form_num == 2 ~ "NPO",
+                          form_num == 3 ~ "GOV",
+                          form_num == 4 ~ "CIC",
+                          form_num == 5 ~ "IND",
+
+
+## Save data
+
+```{r eval = FALSE}
+write_rds(sample_new, file = here("data", "derived_data", "sample_new.rds"))
+write_csv(sample_new, file = here("data", "derived_data", "sample_new.csv"))
+```
+
+
+
+
+
+```{r}
+count(sample_new, factor(form_num), domain)
+```
+
+```{r count-by-level}
+sample_new %>% 
+  mutate(overall = ifelse(domain == "Overall", 1, 0)) %>% 
+  summarize(count_provider = n_distinct(provider_name),
+            count_location = n_distinct(location_id),
+            count_overall_rating = sum(overall),
+            count_rating = n())
+```
+
+```{r count-by-form-level}
+# counts of multi-level observations by the form types
+# statistics corresponding to Table 1
+sample_new %>% 
+  mutate(overall = ifelse(domain == "Overall", 1, 0)) %>% 
+  group_by(factor(form_num)) %>% 
+  summarize(count_provider = n_distinct(provider_name),
+            count_location = n_distinct(location_id),
+            count_overall_rating = sum(overall),
+            count_rating = n())
+```
+
+
+Note:
+                case_when(form_num == 1 ~ "FPO",
+                          form_num == 2 ~ "NPO",
+                          form_num == 3 ~ "GOV",
+                          form_num == 4 ~ "CIC",
+                          form_num == 5 ~ "IND",
+                          
+                          
+                          
+                          
